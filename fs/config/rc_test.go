@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	_ "github.com/rclone/rclone/backend/local"
@@ -201,6 +202,7 @@ func TestRc(t *testing.T) {
 			newName string
 		}{
 			{"missing remote", oldName, "configTestRenameOther"},
+			{"empty name", "", "configTestRenameOther"},
 			{"existing target", newName, testName},
 			{"invalid target", newName, "bad/name"},
 			{"empty target", newName, ""},
@@ -214,9 +216,60 @@ func TestRc(t *testing.T) {
 				assert.Error(t, err)
 			})
 		}
+		if runtime.GOOS == "windows" {
+			_, err := call.Fn(ctx, rc.Params{
+				"name":    newName,
+				"newName": "x",
+			})
+			assert.Error(t, err, "drive letter")
+		}
 		// A failed rename leaves the remote untouched
 		assert.Equal(t, "turnip", config.GetValue(newName, "test_key"))
 		assert.True(t, config.LoadedData().HasSection(testName))
+	})
+
+	t.Run("RenameToDeletedName", func(t *testing.T) {
+		const (
+			oldName = "configTestRenameFrom"
+			newName = "configTestRenameDeleted"
+		)
+		// Cache a backend for a remote then delete the remote
+		config.FileSetValue(newName, "type", "local")
+		fsString := newName + ":" + t.TempDir()
+		deleted, err := cache.Get(ctx, fsString)
+		require.NoError(t, err)
+		config.DeleteRemote(newName)
+
+		config.FileSetValue(oldName, "type", "local")
+		defer config.DeleteRemote(newName)
+		_, err = rc.Calls.Get("config/rename").Fn(ctx, rc.Params{
+			"name":    oldName,
+			"newName": newName,
+		})
+		require.NoError(t, err)
+
+		// The backend of the deleted remote isn't used for the renamed one
+		f, err := cache.Get(ctx, fsString)
+		require.NoError(t, err)
+		assert.NotSame(t, deleted, f)
+	})
+
+	t.Run("RenameInvalidOldName", func(t *testing.T) {
+		const (
+			oldName = "-configTestRenameLegacy"
+			newName = "configTestRenameLegacy"
+		)
+		// Older versions of rclone accepted names starting with "-"
+		config.FileSetValue(oldName, "type", "local")
+		defer config.DeleteRemote(oldName)
+		defer config.DeleteRemote(newName)
+		_, err := rc.Calls.Get("config/rename").Fn(ctx, rc.Params{
+			"name":    oldName,
+			"newName": newName,
+		})
+		require.NoError(t, err)
+		assert.False(t, config.LoadedData().HasSection(oldName))
+		assert.Equal(t, "local", config.GetValue(newName, "type"))
 	})
 
 	// Delete the test remote

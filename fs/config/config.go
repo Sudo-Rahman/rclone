@@ -20,6 +20,7 @@ import (
 	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/obscure"
+	"github.com/rclone/rclone/fs/driveletter"
 	"github.com/rclone/rclone/fs/fspath"
 	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/lib/file"
@@ -701,22 +702,24 @@ func UnsetRemote(name string, keys ...string) (removed []string, err error) {
 //
 // Every key of the remote is moved unchanged, so obscured passwords
 // and tokens keep working. It returns an error if the remote isn't in
-// the config file, if newName isn't a valid remote name or if a
-// remote called newName already exists.
+// the config file, if newName isn't a valid remote name or can be
+// confused with a drive letter, or if a remote called newName already
+// exists.
 //
 // A backend created from the old name before the rename, for example
 // one still in use, may write a refreshed token back under the old
 // name, so only rename remotes which aren't in use.
 func RenameRemoteTo(name, newName string) error {
-	err := fspath.CheckConfigName(name)
+	err := fspath.CheckConfigName(newName)
 	if err != nil {
 		return err
 	}
-	err = fspath.CheckConfigName(newName)
-	if err != nil {
-		return err
+	if driveletter.IsDriveLetter(newName) {
+		return fmt.Errorf("can't use %q as it can be confused with a drive letter", newName)
 	}
-	if !LoadedData().HasSection(name) {
+	// name isn't validated so that a remote whose name has become
+	// invalid can still be renamed, but "" would select the DEFAULT section
+	if name == "" || !LoadedData().HasSection(name) {
 		return fmt.Errorf("remote %q doesn't exist", name)
 	}
 	if LoadedData().HasSection(newName) {
@@ -725,7 +728,10 @@ func RenameRemoteTo(name, newName string) error {
 	copyRemoteKeys(name, newName)
 	LoadedData().DeleteSection(name)
 	SaveConfig()
-	cache.ClearConfig(name) // remove any remotes based on the old name from the cache
+	// Deleting a remote leaves its backends in the cache, so clear
+	// newName as well as name
+	cache.ClearConfig(name)
+	cache.ClearConfig(newName)
 	return nil
 }
 
