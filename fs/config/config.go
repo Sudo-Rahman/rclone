@@ -697,6 +697,47 @@ func UnsetRemote(name string, keys ...string) (removed []string, err error) {
 	return removed, nil
 }
 
+// RenameRemoteTo renames the remote called name to newName.
+//
+// Every key of the remote is moved unchanged, so obscured passwords
+// and tokens keep working. It returns an error if the remote isn't in
+// the config file, if newName isn't a valid remote name or if a
+// remote called newName already exists.
+//
+// A backend created from the old name before the rename, for example
+// one still in use, may write a refreshed token back under the old
+// name, so only rename remotes which aren't in use.
+func RenameRemoteTo(name, newName string) error {
+	err := fspath.CheckConfigName(name)
+	if err != nil {
+		return err
+	}
+	err = fspath.CheckConfigName(newName)
+	if err != nil {
+		return err
+	}
+	if !LoadedData().HasSection(name) {
+		return fmt.Errorf("remote %q doesn't exist", name)
+	}
+	if LoadedData().HasSection(newName) {
+		return fmt.Errorf("remote %q already exists", newName)
+	}
+	copyRemoteKeys(name, newName)
+	LoadedData().DeleteSection(name)
+	SaveConfig()
+	cache.ClearConfig(name) // remove any remotes based on the old name from the cache
+	return nil
+}
+
+// copyRemoteKeys copies every key of the remote name into newName
+// without changing its value.
+func copyRemoteKeys(name, newName string) {
+	for _, key := range LoadedData().GetKeyList(name) {
+		value, _ := FileGetValue(name, key)
+		LoadedData().SetValue(newName, key, value)
+	}
+}
+
 // JSONListProviders prints all the providers and options in JSON format
 func JSONListProviders() error {
 	b, err := json.MarshalIndent(fs.Registry, "", "    ")

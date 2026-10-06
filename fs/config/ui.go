@@ -648,11 +648,7 @@ func DeleteRemote(name string) {
 // it. Returns the new name.
 func copyRemote(name string) string {
 	newName := NewRemoteName()
-	// Copy the keys
-	for _, key := range LoadedData().GetKeyList(name) {
-		value, _ := FileGetValue(name, key)
-		LoadedData().SetValue(newName, key, value)
-	}
+	copyRemoteKeys(name, newName)
 	return newName
 }
 
