@@ -296,6 +296,40 @@ func rcUnset(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 
 func init() {
 	rc.Add(rc.Call{
+		Path:  "config/rename",
+		Fn:    rcRename,
+		Title: "Rename a remote in the config file.",
+		Help: `
+Parameters:
+
+- name - name of remote to rename
+- newName - new name for the remote
+
+The configuration of the remote, including any passwords and tokens,
+is moved unchanged to the new name. It is an error if a remote called
+newName already exists.
+
+Only rename a remote which isn't in use: an operation still running on
+the old name may write a refreshed token back under that name.
+`,
+	})
+}
+
+// Rename a remote in the config file
+func rcRename(ctx context.Context, in rc.Params) (out rc.Params, err error) {
+	name, err := in.GetString("name")
+	if err != nil {
+		return nil, err
+	}
+	newName, err := in.GetString("newName")
+	if err != nil {
+		return nil, err
+	}
+	return nil, RenameRemoteTo(name, newName)
+}
+
+func init() {
+	rc.Add(rc.Call{
 		Path:  "config/setpath",
 		Fn:    rcSetPath,
 		Title: "Set the path of the config file",
