@@ -4,10 +4,12 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	_ "github.com/rclone/rclone/backend/local"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configfile"
 	"github.com/rclone/rclone/fs/config/obscure"
@@ -155,6 +157,119 @@ func TestRc(t *testing.T) {
 		// The key is gone from the config file entirely
 		_, found := config.FileGetValue(testName, "unset_key")
 		assert.False(t, found)
+	})
+
+	t.Run("Rename", func(t *testing.T) {
+		const (
+			oldName = "configTestRenameSource"
+			newName = "configTestRenameTarget"
+		)
+		password := obscure.MustObscure("potato")
+		config.FileSetValue(oldName, "type", "local")
+		config.FileSetValue(oldName, "test_key", "turnip")
+		config.FileSetValue(oldName, "pass", password)
+		defer config.DeleteRemote(newName)
+
+		// Cache a backend for the old name so we can check it is removed
+		fsString := oldName + ":" + t.TempDir()
+		_, err := cache.Get(ctx, fsString)
+		require.NoError(t, err)
+
+		call := rc.Calls.Get("config/rename")
+		assert.NotNil(t, call)
+		out, err := call.Fn(ctx, rc.Params{
+			"name":    oldName,
+			"newName": newName,
+		})
+		require.NoError(t, err)
+		assert.Nil(t, out)
+
+		// The keys moved without being changed
+		assert.False(t, config.LoadedData().HasSection(oldName))
+		assert.Equal(t, "local", config.GetValue(newName, "type"))
+		assert.Equal(t, "turnip", config.GetValue(newName, "test_key"))
+		value, found := config.FileGetValue(newName, "pass")
+		assert.True(t, found)
+		assert.Equal(t, password, value)
+
+		// The old name is gone from the backend cache too
+		_, err = cache.Get(ctx, fsString)
+		assert.Error(t, err)
+
+		for _, test := range []struct {
+			what    string
+			name    string
+			newName string
+		}{
+			{"missing remote", oldName, "configTestRenameOther"},
+			{"empty name", "", "configTestRenameOther"},
+			{"existing target", newName, testName},
+			{"invalid target", newName, "bad/name"},
+			{"empty target", newName, ""},
+			{"same name", newName, newName},
+		} {
+			t.Run(test.what, func(t *testing.T) {
+				_, err := call.Fn(ctx, rc.Params{
+					"name":    test.name,
+					"newName": test.newName,
+				})
+				assert.Error(t, err)
+			})
+		}
+		if runtime.GOOS == "windows" {
+			_, err := call.Fn(ctx, rc.Params{
+				"name":    newName,
+				"newName": "x",
+			})
+			assert.Error(t, err, "drive letter")
+		}
+		// A failed rename leaves the remote untouched
+		assert.Equal(t, "turnip", config.GetValue(newName, "test_key"))
+		assert.True(t, config.LoadedData().HasSection(testName))
+	})
+
+	t.Run("RenameToDeletedName", func(t *testing.T) {
+		const (
+			oldName = "configTestRenameFrom"
+			newName = "configTestRenameDeleted"
+		)
+		// Cache a backend for a remote then delete the remote
+		config.FileSetValue(newName, "type", "local")
+		fsString := newName + ":" + t.TempDir()
+		deleted, err := cache.Get(ctx, fsString)
+		require.NoError(t, err)
+		config.DeleteRemote(newName)
+
+		config.FileSetValue(oldName, "type", "local")
+		defer config.DeleteRemote(newName)
+		_, err = rc.Calls.Get("config/rename").Fn(ctx, rc.Params{
+			"name":    oldName,
+			"newName": newName,
+		})
+		require.NoError(t, err)
+
+		// The backend of the deleted remote isn't used for the renamed one
+		f, err := cache.Get(ctx, fsString)
+		require.NoError(t, err)
+		assert.NotSame(t, deleted, f)
+	})
+
+	t.Run("RenameInvalidOldName", func(t *testing.T) {
+		const (
+			oldName = "-configTestRenameLegacy"
+			newName = "configTestRenameLegacy"
+		)
+		// Older versions of rclone accepted names starting with "-"
+		config.FileSetValue(oldName, "type", "local")
+		defer config.DeleteRemote(oldName)
+		defer config.DeleteRemote(newName)
+		_, err := rc.Calls.Get("config/rename").Fn(ctx, rc.Params{
+			"name":    oldName,
+			"newName": newName,
+		})
+		require.NoError(t, err)
+		assert.False(t, config.LoadedData().HasSection(oldName))
+		assert.Equal(t, "local", config.GetValue(newName, "type"))
 	})
 
 	// Delete the test remote

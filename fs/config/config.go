@@ -21,6 +21,7 @@ import (
 	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/obscure"
+	"github.com/rclone/rclone/fs/driveletter"
 	"github.com/rclone/rclone/fs/fspath"
 	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/lib/file"
@@ -694,6 +695,52 @@ func UnsetRemote(name string, keys ...string) (removed []string, err error) {
 	SaveConfig()
 	cache.ClearConfig(name) // remove any remotes based on this config from the cache
 	return removed, nil
+}
+
+// RenameRemoteTo renames the remote called name to newName.
+//
+// Every key of the remote is moved unchanged, so obscured passwords
+// and tokens keep working. It returns an error if the remote isn't in
+// the config file, if newName isn't a valid remote name or can be
+// confused with a drive letter, or if a remote called newName already
+// exists.
+//
+// A backend created from the old name before the rename, for example
+// one still in use, may write a refreshed token back under the old
+// name, so only rename remotes which aren't in use.
+func RenameRemoteTo(name, newName string) error {
+	err := fspath.CheckConfigName(newName)
+	if err != nil {
+		return err
+	}
+	if driveletter.IsDriveLetter(newName) {
+		return fmt.Errorf("can't use %q as it can be confused with a drive letter", newName)
+	}
+	// name isn't validated so that a remote whose name has become
+	// invalid can still be renamed, but "" would select the DEFAULT section
+	if name == "" || !LoadedData().HasSection(name) {
+		return fmt.Errorf("remote %q doesn't exist", name)
+	}
+	if LoadedData().HasSection(newName) {
+		return fmt.Errorf("remote %q already exists", newName)
+	}
+	copyRemoteKeys(name, newName)
+	LoadedData().DeleteSection(name)
+	SaveConfig()
+	// Deleting a remote leaves its backends in the cache, so clear
+	// newName as well as name
+	cache.ClearConfig(name)
+	cache.ClearConfig(newName)
+	return nil
+}
+
+// copyRemoteKeys copies every key of the remote name into newName
+// without changing its value.
+func copyRemoteKeys(name, newName string) {
+	for _, key := range LoadedData().GetKeyList(name) {
+		value, _ := FileGetValue(name, key)
+		LoadedData().SetValue(newName, key, value)
+	}
 }
 
 // JSONListProviders prints all the providers and options in JSON format
