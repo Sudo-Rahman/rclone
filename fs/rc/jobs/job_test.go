@@ -1,10 +1,13 @@
 package jobs
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"runtime"
+	"slices"
 	"testing"
 	"time"
 
@@ -533,7 +536,7 @@ func TestRcJobStatus(t *testing.T) {
 	out, err := call.Fn(context.Background(), in)
 	require.NoError(t, err)
 	require.NotNil(t, out)
-	assert.Equal(t, float64(1), out["id"])
+	assert.Equal(t, int64(1), out["id"])
 	assert.Equal(t, executeID, out["executeId"])
 	assert.Equal(t, "", out["error"])
 	assert.Equal(t, false, out["finished"])
@@ -548,6 +551,97 @@ func TestRcJobStatus(t *testing.T) {
 	_, err = call.Fn(context.Background(), in)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "Didn't find key")
+}
+
+func TestRcJobStatusSharesTheFinishedOutput(t *testing.T) {
+	ctx := context.Background()
+	jobID.Store(0)
+	// 2^53 + 1 does not survive a round trip through float64.
+	const exact = int64(1<<53 + 1)
+	listing := []int64{exact}
+	job, _, err := NewJob(ctx, func(ctx context.Context, in rc.Params) (rc.Params, error) {
+		return rc.Params{"list": listing}, nil
+	}, rc.Params{"_async": true})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		job.mu.Lock()
+		defer job.mu.Unlock()
+		return job.Finished
+	}, time.Second, time.Millisecond)
+
+	out, err := rc.Calls.Get("job/status").Fn(ctx, rc.Params{"jobid": job.ID})
+	require.NoError(t, err)
+
+	output, ok := out["output"].(rc.Params)
+	require.True(t, ok)
+	reported, ok := output["list"].([]int64)
+	require.True(t, ok, "the output is shared, not decoded again from JSON")
+	assert.Same(t, &listing[0], &reported[0])
+	assert.Equal(t, true, out["finished"])
+	assert.Equal(t, true, out["success"])
+
+	// The reply is built by hand, so it must keep every field the job serializes.
+	var serialized rc.Params
+	require.NoError(t, rc.Reshape(&serialized, job))
+	assert.Equal(t, slices.Sorted(maps.Keys(serialized)), slices.Sorted(maps.Keys(out)))
+
+	var buf bytes.Buffer
+	require.NoError(t, rc.WriteJSON(&buf, out))
+	var wire struct {
+		ID        int64           `json:"id"`
+		ExecuteID string          `json:"executeId"`
+		Group     string          `json:"group"`
+		StartTime time.Time       `json:"startTime"`
+		EndTime   time.Time       `json:"endTime"`
+		Error     string          `json:"error"`
+		Finished  bool            `json:"finished"`
+		Success   bool            `json:"success"`
+		Duration  float64         `json:"duration"`
+		Output    json.RawMessage `json:"output"`
+	}
+	decoder := json.NewDecoder(&buf)
+	decoder.DisallowUnknownFields()
+	require.NoError(t, decoder.Decode(&wire))
+	assert.Equal(t, job.ID, wire.ID)
+	assert.Equal(t, executeID, wire.ExecuteID)
+	assert.Equal(t, "job/1", wire.Group)
+	assert.False(t, wire.StartTime.IsZero())
+	assert.False(t, wire.EndTime.Before(wire.StartTime))
+	assert.True(t, wire.Finished)
+	assert.True(t, wire.Success)
+	assert.JSONEq(t, `{"list":[9007199254740993]}`, string(wire.Output))
+}
+
+func TestNewJobDoesNotRetainASynchronousOutput(t *testing.T) {
+	ctx := context.Background()
+	jobID.Store(0)
+	job, out, err := NewJob(ctx, func(ctx context.Context, in rc.Params) (rc.Params, error) {
+		return rc.Params{"list": []string{"a", "b"}}, nil
+	}, rc.Params{})
+	require.NoError(t, err)
+	assert.Equal(t, rc.Params{"list": []string{"a", "b"}}, out, "the caller receives the output")
+
+	status, err := rc.Calls.Get("job/status").Fn(ctx, rc.Params{"jobid": job.ID})
+	require.NoError(t, err)
+	assert.Equal(t, true, status["finished"])
+	assert.Equal(t, true, status["success"])
+	assert.Nil(t, status["output"], "the job table keeps only the status")
+}
+
+func TestNewJobDoesNotRetainAFailedSynchronousOutput(t *testing.T) {
+	ctx := context.Background()
+	jobID.Store(0)
+	testErr := errors.New("test error")
+	job, _, err := NewJob(ctx, func(ctx context.Context, in rc.Params) (rc.Params, error) {
+		return rc.Params{"partial": true}, testErr
+	}, rc.Params{})
+	assert.Equal(t, testErr, err, "the error still reaches the caller")
+
+	status, err := rc.Calls.Get("job/status").Fn(ctx, rc.Params{"jobid": job.ID})
+	require.NoError(t, err)
+	assert.Equal(t, testErr.Error(), status["error"])
+	assert.Equal(t, false, status["success"])
+	assert.Nil(t, status["output"])
 }
 
 func TestRcJobList(t *testing.T) {
@@ -612,7 +706,7 @@ func TestRcAsyncJobStop(t *testing.T) {
 	out, err = call.Fn(context.Background(), in)
 	require.NoError(t, err)
 	require.NotNil(t, out)
-	assert.Equal(t, float64(1), out["id"])
+	assert.Equal(t, int64(1), out["id"])
 	assert.Equal(t, "context canceled", out["error"])
 	assert.Equal(t, true, out["finished"])
 	assert.Equal(t, false, out["success"])
@@ -656,7 +750,7 @@ func TestRcSyncJobStop(t *testing.T) {
 	out, err = call.Fn(context.Background(), in)
 	require.NoError(t, err)
 	require.NotNil(t, out)
-	assert.Equal(t, float64(1), out["id"])
+	assert.Equal(t, int64(1), out["id"])
 	assert.Equal(t, "context canceled", out["error"])
 	assert.Equal(t, true, out["finished"])
 	assert.Equal(t, false, out["success"])

@@ -80,6 +80,28 @@ func (job *Job) finish(out rc.Params, err error) {
 	running.kickExpire() // make sure this job gets expired
 }
 
+// status returns the reply of job/status for this job.
+//
+// The output is shared rather than copied: a job sets it once when it
+// finishes and never changes it afterwards, so the reply can be written
+// after the lock is released, without a deep copy of a possibly large output.
+func (job *Job) status() rc.Params {
+	job.mu.Lock()
+	defer job.mu.Unlock()
+	return rc.Params{
+		"id":        job.ID,
+		"executeId": job.ExecuteID,
+		"group":     job.Group,
+		"startTime": job.StartTime,
+		"endTime":   job.EndTime,
+		"error":     job.Error,
+		"finished":  job.Finished,
+		"success":   job.Success,
+		"duration":  job.Duration,
+		"output":    job.Output,
+	}
+}
+
 func (job *Job) removeListener(fn *func()) {
 	job.mu.Lock()
 	defer job.mu.Unlock()
@@ -307,8 +329,15 @@ func (jobs *Jobs) NewJob(ctx context.Context, fn rc.Func, in rc.Params) (job *Jo
 		err = nil
 	} else {
 		job.run(ctx, fn, in)
+		// A synchronous job hands its output to the caller, so the job
+		// table keeps only its status. Retaining the output would hold
+		// every reply, including job/status replies and whole listings,
+		// until the job expires.
+		job.mu.Lock()
 		out = job.Output
 		err = job.realErr
+		job.Output = nil
+		job.mu.Unlock()
 	}
 	return job, out, err
 }
@@ -365,7 +394,9 @@ Results:
 - executeId - rclone instance ID (changes after restart); combined with id uniquely identifies a job
 - startTime - time the job started (e.g. "2018-10-26T18:50:20.528336039+01:00")
 - success - boolean - true for success false otherwise
-- output - output of the job as would have been returned if called synchronously
+- output - output of the job as would have been returned if called synchronously.
+  A job called synchronously returns its output in its reply only, so its
+  status reports null.
 - progress - output of the progress related to the underlying job
 `,
 	})
@@ -381,14 +412,7 @@ func rcJobStatus(ctx context.Context, in rc.Params) (out rc.Params, err error) {
 	if job == nil {
 		return nil, errors.New("job not found")
 	}
-	job.mu.Lock()
-	defer job.mu.Unlock()
-	out = make(rc.Params)
-	err = rc.Reshape(&out, job)
-	if err != nil {
-		return nil, fmt.Errorf("reshape failed in job status: %w", err)
-	}
-	return out, nil
+	return job.status(), nil
 }
 
 func init() {
