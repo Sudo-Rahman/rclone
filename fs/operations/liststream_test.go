@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/fs/rc/jobs"
 	"github.com/stretchr/testify/assert"
@@ -117,6 +118,51 @@ func TestRcListStream(t *testing.T) {
 	sort.Strings(paths)
 	assert.Equal(t, []string{"subdir/b", "subdir/c", "subdir/deeper"}, paths, "without recurse only the directory itself is listed")
 	assert.Equal(t, int64(3), trailer.Count)
+}
+
+// Items are encoded one at a time into a reused item, so each one must still have exactly the
+// bytes operations/list gives it, with nothing carried over from the previous entry.
+func TestRcListStreamEncodesItemsLikeOperationsList(t *testing.T) {
+	r, call := rcNewRun(t, "operations/liststream")
+	ctx := context.Background()
+	r.WriteObject(ctx, "plain", "a", t1)
+	r.WriteObject(ctx, "tom & jerry <quoted \"name\">", "bb", t2)
+	r.WriteObject(ctx, "dossier é/fichier ünïcode", "ccc", t2)
+	r.WriteObject(ctx, "dossier é/sub/deep", "dddd", t1)
+	opt := operations.ListJSONOpt{Recurse: true, ShowHash: true}
+
+	expected := map[string]string{}
+	require.NoError(t, operations.ListJSON(ctx, r.Fremote, "", &opt, func(item *operations.ListJSONItem) error {
+		encoded, err := json.Marshal(item)
+		expected[item.Path] = string(encoded)
+		return err
+	}))
+	body := runListStream(t, call, rc.Params{
+		"fs":     r.FremoteName,
+		"remote": "",
+		"opt":    rc.Params{"recurse": true, "showHash": true},
+	})
+
+	lines := strings.Split(strings.TrimSuffix(body, "\n"), "\n")
+	streamed := 0
+	for _, line := range lines[:len(lines)-1] {
+		var batch struct {
+			List []json.RawMessage `json:"list"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(line), &batch))
+		items := make([]string, len(batch.List))
+		for i, raw := range batch.List {
+			var item struct{ Path string }
+			require.NoError(t, json.Unmarshal(raw, &item))
+			assert.Equal(t, expected[item.Path], string(raw), "item %q", item.Path)
+			items[i] = string(raw)
+		}
+		assert.Equal(t, `{"list":[`+strings.Join(items, ",")+`]}`, line, "the line is the encoded batch")
+		streamed += len(items)
+	}
+	assert.Equal(t, len(expected), streamed)
+	_, trailer := readListStream(t, body)
+	assert.Equal(t, int64(len(expected)), trailer.Count)
 }
 
 func TestRcListStreamSendsItsJobIdentityBeforeTheListing(t *testing.T) {

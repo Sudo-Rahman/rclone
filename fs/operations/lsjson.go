@@ -158,20 +158,30 @@ func newListJSON(ctx context.Context, fsrc fs.Fs, remote string, opt *ListJSONOp
 //
 // It may return nil if there is no entry to return
 func (lj *listJSON) entry(ctx context.Context, entry fs.DirEntry) (*ListJSONItem, error) {
+	item := new(ListJSONItem)
+	if !lj.fill(ctx, entry, item) {
+		return nil, nil
+	}
+	return item, nil
+}
+
+// fill sets every field of item from entry, so a caller that encodes items one at a time can
+// reuse a single item. It returns false if the options leave entry out of the listing.
+func (lj *listJSON) fill(ctx context.Context, entry fs.DirEntry, item *ListJSONItem) bool {
 	switch entry.(type) {
 	case fs.Directory:
 		if lj.opt.FilesOnly {
-			return nil, nil
+			return false
 		}
 	case fs.Object:
 		if lj.opt.DirsOnly {
-			return nil, nil
+			return false
 		}
 	default:
 		fs.Errorf(nil, "Unknown type %T in listing", entry)
 	}
 
-	item := &ListJSONItem{
+	*item = ListJSONItem{
 		Path: entry.Remote(),
 		Name: path.Base(entry.Remote()),
 		Size: entry.Size(),
@@ -237,7 +247,7 @@ func (lj *listJSON) entry(ctx context.Context, entry fs.DirEntry) (*ListJSONItem
 	default:
 		fs.Errorf(nil, "Unknown type %T in listing in ListJSON", entry)
 	}
-	return item, nil
+	return true
 }
 
 // ListJSON lists fsrc using the options in opt calling callback for each item

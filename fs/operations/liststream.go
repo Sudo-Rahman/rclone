@@ -2,11 +2,13 @@ package operations
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"sync"
 
@@ -53,11 +55,6 @@ so it must be called synchronously over HTTP: "_async" is refused.
 	})
 }
 
-// listStreamBatch is one line of the stream: the items of one listing callback.
-type listStreamBatch struct {
-	List []*ListJSONItem `json:"list"`
-}
-
 // listStreamTrailer is the last line of a stream whose listing ran to its end.
 type listStreamTrailer struct {
 	Done  bool   `json:"done"`
@@ -67,6 +64,62 @@ type listStreamTrailer struct {
 
 // listStreamBufferSize batches small lines into fewer writes to the connection.
 const listStreamBufferSize = 64 * 1024
+
+// listStreamReleaseThreshold is the number of streamed items from which the memory freed by the
+// listing is handed back to the operating system once the stream has ended.
+const listStreamReleaseThreshold = 100_000
+
+// listStreamBatchWriter writes the {"list": [...]} line of one listing callback item by item,
+// so a directory of millions of entries is never held as items or as one encoded line. The
+// bytes are those json.Encoder writes for the whole batch.
+type listStreamBatchWriter struct {
+	out     *bufio.Writer
+	item    ListJSONItem // refilled for every entry
+	encoded bytes.Buffer
+	encoder *json.Encoder
+}
+
+func newListStreamBatchWriter(out *bufio.Writer) *listStreamBatchWriter {
+	b := &listStreamBatchWriter{out: out}
+	b.encoder = json.NewEncoder(&b.encoded)
+	return b
+}
+
+// write writes the listed entries as one line and returns how many were written. Without any
+// listed entry nothing is written. If an item cannot be encoded, the line is closed so the
+// stream stays line-delimited, and the error is returned.
+func (b *listStreamBatchWriter) write(ctx context.Context, lj *listJSON, entries fs.DirEntries) (written int64, err error) {
+	for _, entry := range entries {
+		if !lj.fill(ctx, entry, &b.item) {
+			continue
+		}
+		b.encoded.Reset()
+		if err = b.encoder.Encode(&b.item); err != nil {
+			err = fmt.Errorf("creating entry failed in ListJSON: %w", err)
+			break
+		}
+		separator := ","
+		if written == 0 {
+			separator = `{"list":[`
+		}
+		// bufio keeps the first write error and returns it from every later write, so checking
+		// the item's write also covers its separator.
+		_, _ = b.out.WriteString(separator)
+		// Encode ends the item with a newline, which belongs only after the whole line.
+		if _, werr := b.out.Write(b.encoded.Bytes()[:b.encoded.Len()-1]); werr != nil {
+			return written, fmt.Errorf("writing the listing stream failed: %w", werr)
+		}
+		written++
+	}
+	b.item = ListJSONItem{} // keep no reference to the last entry
+	if written == 0 {
+		return 0, err
+	}
+	if _, werr := b.out.WriteString("]}\n"); werr != nil && err == nil {
+		err = fmt.Errorf("writing the listing stream failed: %w", werr)
+	}
+	return written, err
+}
 
 // Stream the listing of the directory
 func rcListStream(ctx context.Context, in rc.Params) (out rc.Params, err error) {
@@ -108,40 +161,33 @@ func rcListStream(ctx context.Context, in rc.Params) (out rc.Params, err error) 
 		fs.Debugf(f, "operations/liststream: failed to send the headers: %v", err)
 	}
 	buffered := bufio.NewWriterSize(w, listStreamBufferSize)
-	encoder := json.NewEncoder(buffered)
+	batches := newListStreamBatchWriter(buffered)
 	var (
-		mu    sync.Mutex // keeps every batch on its own contiguous line
+		// walk already calls back one batch at a time; the lock also keeps each line whole for a
+		// backend that would not.
+		mu    sync.Mutex
 		count int64
 	)
 	listErr := walk.ListR(ctx, f, remote, false, ConfigMaxDepth(ctx, lj.opt.Recurse), walk.ListAll, func(entries fs.DirEntries) error {
-		batch := listStreamBatch{List: make([]*ListJSONItem, 0, len(entries))}
-		for _, entry := range entries {
-			item, err := lj.entry(ctx, entry)
-			if err != nil {
-				return fmt.Errorf("creating entry failed in ListJSON: %w", err)
-			}
-			if item != nil {
-				batch.List = append(batch.List, item)
-			}
-		}
-		if len(batch.List) == 0 {
-			return nil
-		}
 		mu.Lock()
 		defer mu.Unlock()
-		if err := encoder.Encode(batch); err != nil {
-			return fmt.Errorf("writing the listing stream failed: %w", err)
-		}
-		count += int64(len(batch.List))
-		return nil
+		written, err := batches.write(ctx, lj, entries)
+		count += written
+		return err
 	})
+	if count >= listStreamReleaseThreshold {
+		// Go returns freed memory to the system only minutes after a large listing, so a walk of
+		// millions of entries would keep its peak long after its reply. Hand it back once the
+		// stream has ended, without delaying the reply.
+		defer func() { go debug.FreeOSMemory() }()
+	}
 
 	// Every listing callback has returned, so the trailer needs no lock.
 	trailer := listStreamTrailer{Done: true, Count: count}
 	if listErr != nil {
 		trailer.Error = fmt.Errorf("error in ListJSON: %w", listErr).Error()
 	}
-	if err := encoder.Encode(trailer); err != nil {
+	if err := json.NewEncoder(buffered).Encode(trailer); err != nil {
 		fs.Debugf(f, "operations/liststream: failed to write the trailer: %v", err)
 		return nil, nil
 	}
