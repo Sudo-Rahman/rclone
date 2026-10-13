@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -1078,4 +1079,93 @@ func TestDirMapSendEntries(t *testing.T) {
 	err = dm.sendEntries(callback)
 	require.NoError(t, err)
 	assert.Equal(t, []string(nil), got)
+}
+
+// dirListFs lists the directories of a fixed tree and fails the
+// directories in errs.
+type dirListFs struct {
+	fs.Fs
+	dirs map[string]fs.DirEntries
+	errs map[string]error
+}
+
+func (f *dirListFs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
+	if err := f.errs[dir]; err != nil {
+		return nil, err
+	}
+	entries, ok := f.dirs[dir]
+	if !ok {
+		return nil, fs.ErrorDirNotFound
+	}
+	return entries, nil
+}
+
+func newDirListFs(t *testing.T, errs map[string]error) *dirListFs {
+	mock, err := mockfs.NewFs(context.Background(), "mock", "/", nil)
+	require.NoError(t, err)
+	return &dirListFs{
+		Fs: mock,
+		dirs: map[string]fs.DirEntries{
+			"":    {mockobject.Object("a"), mockdir.New("b"), mockdir.New("c")},
+			"b":   {mockobject.Object("b/x"), mockdir.New("b/y")},
+			"b/y": {mockobject.Object("b/y/z")},
+			"c":   {mockobject.Object("c/w")},
+		},
+		errs: errs,
+	}
+}
+
+func TestListRDirErrors(t *testing.T) {
+	ctx := context.Background()
+	listAll := func(f fs.Fs, dirErr DirErrorFn) (got []string, err error) {
+		err = ListRDirErrors(ctx, f, "", true, -1, ListAll, func(entries fs.DirEntries) error {
+			for _, entry := range entries {
+				got = append(got, entry.Remote())
+			}
+			return nil
+		}, dirErr)
+		sort.Strings(got)
+		return got, err
+	}
+	type dirError struct {
+		dir string
+		err error
+	}
+
+	// Every directory listed
+	var dirErrs []dirError
+	got, err := listAll(newDirListFs(t, nil), func(dir string, err error) {
+		dirErrs = append(dirErrs, dirError{dir, err})
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a", "b", "b/x", "b/y", "b/y/z", "c", "c/w"}, got)
+	assert.Empty(t, dirErrs)
+
+	// Every directory which can't be listed is reported and the walk
+	// carries on without failing the listing
+	errC := errors.New("c failed")
+	f := newDirListFs(t, map[string]error{"b/y": errorBoom, "c": errC})
+	dirErrs = nil
+	got, err = listAll(f, func(dir string, err error) {
+		dirErrs = append(dirErrs, dirError{dir, err})
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a", "b", "b/x", "b/y", "c"}, got, "the directories are still listed by their parents")
+	sort.Slice(dirErrs, func(i, j int) bool { return dirErrs[i].dir < dirErrs[j].dir })
+	assert.Equal(t, []dirError{{"b/y", errorBoom}, {"c", errC}}, dirErrs)
+
+	// Without dirErr this is ListR, which returns the last error
+	_, err = listAll(newDirListFs(t, map[string]error{"c": errC}), nil)
+	assert.Equal(t, errC, err)
+	err = ListR(ctx, newDirListFs(t, map[string]error{"c": errC}), "", true, -1, ListAll, func(fs.DirEntries) error { return nil })
+	assert.Equal(t, errC, err)
+
+	// The directory being listed is not reported, it fails the listing
+	dirErrs = nil
+	got, err = listAll(newDirListFs(t, map[string]error{"": errC}), func(dir string, err error) {
+		dirErrs = append(dirErrs, dirError{dir, err})
+	})
+	assert.Equal(t, errC, err)
+	assert.Empty(t, got)
+	assert.Empty(t, dirErrs)
 }
