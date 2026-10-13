@@ -147,6 +147,26 @@ func (l ListType) Filter(in *fs.DirEntries) {
 //
 // NB (f, path) to be replaced by fs.Dir at some point
 func ListR(ctx context.Context, f fs.Fs, path string, includeAll bool, maxLevel int, listType ListType, fn fs.ListRCallback) error {
+	return ListRDirErrors(ctx, f, path, includeAll, maxLevel, listType, fn, nil)
+}
+
+// DirErrorFn is called with a directory which could not be listed and
+// the error listing it.
+type DirErrorFn func(dir string, err error)
+
+// ListRDirErrors lists the directory recursively like ListR, but a
+// directory below path which can't be listed while the directory is
+// walked directory by directory is passed to dirErr instead of being
+// returned as an error. The walk carries on with the other directories
+// as ListR does, so the caller learns every directory which is missing
+// from the listing rather than only the last one.
+//
+// An error listing path itself, or one which stops the listing, is
+// still returned. When the backend lists recursively in one call, its
+// errors are returned as ListR returns them and dirErr is not called.
+//
+// dirErr is not called concurrently. If it is nil, this is ListR.
+func ListRDirErrors(ctx context.Context, f fs.Fs, path string, includeAll bool, maxLevel int, listType ListType, fn fs.ListRCallback, dirErr DirErrorFn) error {
 	fi := filter.GetConfig(ctx)
 	// FIXME disable this with --no-fast-list ??? `--disable ListR` will do it...
 	doListR := f.Features().ListR
@@ -157,22 +177,30 @@ func ListR(ctx context.Context, f fs.Fs, path string, includeAll bool, maxLevel 
 		maxLevel >= 0 || // ...using bounded recursion
 		len(fi.Opt.ExcludeFile) > 0 || // ...using --exclude-file
 		fi.UsesDirectoryFilters() { // ...using any directory filters
-		return listRwalk(ctx, f, path, includeAll, maxLevel, listType, fn)
+		return listRwalk(ctx, f, path, includeAll, maxLevel, listType, fn, dirErr)
 	}
 	ctx = filter.SetUseFilter(ctx, f.Features().FilterAware && !includeAll) // make filter-aware backends constrain List
 	return listR(ctx, f, path, includeAll, listType, fn, doListR, listType.Dirs() && f.Features().BucketBased)
 }
 
 // listRwalk walks the file tree for ListR using Walk
+//
+// A directory below path which can't be listed is passed to dirErr if
+// it is set, otherwise the last such error is returned.
+//
 // Note: this will flag filter-aware backends (via Walk)
-func listRwalk(ctx context.Context, f fs.Fs, path string, includeAll bool, maxLevel int, listType ListType, fn fs.ListRCallback) error {
+func listRwalk(ctx context.Context, f fs.Fs, path string, includeAll bool, maxLevel int, listType ListType, fn fs.ListRCallback, dirErr DirErrorFn) error {
 	var listErr error
-	walkErr := Walk(ctx, f, path, includeAll, maxLevel, func(path string, entries fs.DirEntries, err error) error {
+	walkErr := Walk(ctx, f, path, includeAll, maxLevel, func(dir string, entries fs.DirEntries, err error) error {
 		// Carry on listing but return the error at the end
 		if err != nil {
-			listErr = err
+			if dirErr != nil && dir != path {
+				dirErr(dir, err)
+			} else {
+				listErr = err
+			}
 			err = fs.CountError(ctx, err)
-			fs.Errorf(path, "error listing: %v", err)
+			fs.Errorf(dir, "error listing: %v", err)
 			return nil
 		}
 		listType.Filter(&entries)
