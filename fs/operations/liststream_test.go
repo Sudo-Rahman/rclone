@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path"
@@ -12,6 +14,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/fs/rc/jobs"
@@ -29,10 +33,18 @@ type listStreamItem struct {
 
 // listStreamLine decodes either kind of operations/liststream line.
 type listStreamLine struct {
-	List  []listStreamItem `json:"list"`
-	Done  bool             `json:"done"`
-	Count int64            `json:"count"`
-	Error string           `json:"error"`
+	List          []listStreamItem `json:"list"`
+	Done          bool             `json:"done"`
+	Count         int64            `json:"count"`
+	Error         string           `json:"error"`
+	DirErrors     []listStreamDirError
+	DirErrorCount int64
+}
+
+// listStreamDirError decodes a directory the trailer reports as not listed.
+type listStreamDirError struct {
+	Path  string `json:"path"`
+	Error string `json:"error"`
 }
 
 // A synchronous rc call runs on the context of its HTTP request, which carries the server.
@@ -44,6 +56,7 @@ func listStreamContext() context.Context {
 func readListStream(t *testing.T, body string) (batches [][]listStreamItem, trailer listStreamLine) {
 	t.Helper()
 	scanner := bufio.NewScanner(strings.NewReader(body))
+	scanner.Buffer(nil, len(body)+1) // a line holds a whole directory
 	var lines []listStreamLine
 	for scanner.Scan() {
 		var line listStreamLine
@@ -200,6 +213,105 @@ func TestRcListStreamReportsListingErrorsInTheTrailer(t *testing.T) {
 	assert.Empty(t, batches)
 	assert.Equal(t, int64(0), trailer.Count)
 	assert.Contains(t, trailer.Error, "directory not found")
+}
+
+// listFailingFs is a remote which fails to list the directories fail returns an error for.
+type listFailingFs struct {
+	fs.Fs
+	fail func(dir string) error
+}
+
+func (f *listFailingFs) Name() string { return "listfailing" }
+
+func (f *listFailingFs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
+	if err := f.fail(dir); err != nil {
+		return nil, err
+	}
+	return f.Fs.List(ctx, dir)
+}
+
+func TestRcListStreamReportsDirectoriesWhichCantBeListed(t *testing.T) {
+	r, call := rcNewRun(t, "operations/liststream")
+	ctx := context.Background()
+	r.WriteObject(ctx, "a", "a", t1)
+	r.WriteObject(ctx, "ok/b", "bb", t2)
+	r.WriteObject(ctx, "broken/c", "ccc", t2)
+	r.WriteObject(ctx, "ok/broken/d", "dddd", t2)
+	f := &listFailingFs{Fs: r.Fremote, fail: func(dir string) error {
+		if path.Base(dir) == "broken" {
+			return errors.New("operation timed out")
+		}
+		return nil
+	}}
+	cache.Put("listfailing:", f)
+
+	body := runListStream(t, call, rc.Params{
+		"fs":     "listfailing:",
+		"remote": "",
+		"opt":    rc.Params{"recurse": true},
+	})
+	batches, trailer := readListStream(t, body)
+
+	assert.Empty(t, trailer.Error, "a directory which can't be listed doesn't fail the listing")
+	var paths []string
+	for _, batch := range batches {
+		for _, item := range batch {
+			paths = append(paths, item.Path)
+		}
+	}
+	sort.Strings(paths)
+	assert.Equal(t, []string{"a", "broken", "ok", "ok/b", "ok/broken"}, paths, "the walk carries on past the directories it can't list")
+	assert.Equal(t, int64(len(paths)), trailer.Count)
+	sort.Slice(trailer.DirErrors, func(i, j int) bool { return trailer.DirErrors[i].Path < trailer.DirErrors[j].Path })
+	assert.Equal(t, []listStreamDirError{
+		{Path: "broken", Error: "operation timed out"},
+		{Path: "ok/broken", Error: "operation timed out"},
+	}, trailer.DirErrors)
+	assert.Equal(t, int64(2), trailer.DirErrorCount)
+
+	// The listed directory itself fails the listing
+	body = runListStream(t, call, rc.Params{
+		"fs":     "listfailing:",
+		"remote": "broken",
+		"opt":    rc.Params{"recurse": true},
+	})
+	batches, trailer = readListStream(t, body)
+	assert.Empty(t, batches)
+	assert.Contains(t, trailer.Error, "operation timed out")
+	assert.Empty(t, trailer.DirErrors)
+	assert.Zero(t, trailer.DirErrorCount)
+
+	// A stream which lists every directory it walks has no dirErrors at all
+	body = runListStream(t, call, rc.Params{"fs": "listfailing:", "remote": "ok"})
+	_, trailer = readListStream(t, body)
+	assert.Empty(t, trailer.Error)
+	assert.NotContains(t, body, "dirError")
+}
+
+func TestRcListStreamBoundsTheDirectoriesItNames(t *testing.T) {
+	r, call := rcNewRun(t, "operations/liststream")
+	ctx := context.Background()
+	const dirs = 1001
+	for i := range dirs {
+		require.NoError(t, r.Fremote.Mkdir(ctx, fmt.Sprintf("many/%04d", i)))
+	}
+	cache.Put("listfailing:", &listFailingFs{Fs: r.Fremote, fail: func(dir string) error {
+		if path.Dir(dir) == "many" {
+			return errors.New("boom")
+		}
+		return nil
+	}})
+
+	body := runListStream(t, call, rc.Params{
+		"fs":     "listfailing:",
+		"remote": "",
+		"opt":    rc.Params{"recurse": true},
+	})
+	_, trailer := readListStream(t, body)
+
+	assert.Empty(t, trailer.Error)
+	assert.Len(t, trailer.DirErrors, 1000)
+	assert.Equal(t, int64(dirs), trailer.DirErrorCount)
 }
 
 func TestRcListStreamRefusesToRunWithoutItsHTTPRequest(t *testing.T) {

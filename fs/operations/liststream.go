@@ -44,6 +44,16 @@ listed, as newline-delimited JSON (application/x-ndjson):
   items written; error is set only if the listing failed, in which case
   the batches already written are incomplete.
 
+When the remote is walked directory by directory, a directory below
+the listed path which can't be listed doesn't fail the listing: the
+walk carries on with the other directories and the final line reports
+it in "dirErrors", a list of {"path": "...", "error": "..."}, and in
+"dirErrorCount". The directory is still listed as an item of its
+parent, but its own entries are missing. dirErrors names at most the
+first 1000 such directories and dirErrorCount counts them all. Both
+are omitted when every directory was listed. A remote listed
+recursively in one call reports its errors in "error" only.
+
 A stream which ends without the final line was interrupted, and
 anything after it is not part of the listing. Closing the connection
 cancels the listing. The response headers are sent as soon as the
@@ -57,10 +67,22 @@ so it must be called synchronously over HTTP: "_async" is refused.
 
 // listStreamTrailer is the last line of a stream whose listing ran to its end.
 type listStreamTrailer struct {
-	Done  bool   `json:"done"`
-	Count int64  `json:"count"`
-	Error string `json:"error,omitempty"`
+	Done          bool                 `json:"done"`
+	Count         int64                `json:"count"`
+	Error         string               `json:"error,omitempty"`
+	DirErrors     []listStreamDirError `json:"dirErrors,omitempty"`
+	DirErrorCount int64                `json:"dirErrorCount,omitempty"`
 }
+
+// listStreamDirError is a directory the walk could not list.
+type listStreamDirError struct {
+	Path  string `json:"path"`
+	Error string `json:"error"`
+}
+
+// listStreamMaxDirErrors bounds the directories the trailer names, so a remote failing every
+// directory can't make it unbounded.
+const listStreamMaxDirErrors = 1000
 
 // listStreamBufferSize batches small lines into fewer writes to the connection.
 const listStreamBufferSize = 64 * 1024
@@ -165,15 +187,24 @@ func rcListStream(ctx context.Context, in rc.Params) (out rc.Params, err error) 
 	var (
 		// walk already calls back one batch at a time; the lock also keeps each line whole for a
 		// backend that would not.
-		mu    sync.Mutex
-		count int64
+		mu            sync.Mutex
+		count         int64
+		dirErrors     []listStreamDirError
+		dirErrorCount int64
 	)
-	listErr := walk.ListR(ctx, f, remote, false, ConfigMaxDepth(ctx, lj.opt.Recurse), walk.ListAll, func(entries fs.DirEntries) error {
+	listErr := walk.ListRDirErrors(ctx, f, remote, false, ConfigMaxDepth(ctx, lj.opt.Recurse), walk.ListAll, func(entries fs.DirEntries) error {
 		mu.Lock()
 		defer mu.Unlock()
 		written, err := batches.write(ctx, lj, entries)
 		count += written
 		return err
+	}, func(dir string, err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		dirErrorCount++
+		if len(dirErrors) < listStreamMaxDirErrors {
+			dirErrors = append(dirErrors, listStreamDirError{Path: dir, Error: err.Error()})
+		}
 	})
 	if count >= listStreamReleaseThreshold {
 		// Go returns freed memory to the system only minutes after a large listing, so a walk of
@@ -183,7 +214,7 @@ func rcListStream(ctx context.Context, in rc.Params) (out rc.Params, err error) 
 	}
 
 	// Every listing callback has returned, so the trailer needs no lock.
-	trailer := listStreamTrailer{Done: true, Count: count}
+	trailer := listStreamTrailer{Done: true, Count: count, DirErrors: dirErrors, DirErrorCount: dirErrorCount}
 	if listErr != nil {
 		trailer.Error = fmt.Errorf("error in ListJSON: %w", listErr).Error()
 	}
