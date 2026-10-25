@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"sync"
 
@@ -63,6 +64,10 @@ type listStreamTrailer struct {
 
 // listStreamBufferSize batches small lines into fewer writes to the connection.
 const listStreamBufferSize = 64 * 1024
+
+// listStreamReleaseThreshold is the number of streamed items from which the memory freed by the
+// listing is handed back to the operating system once the stream has ended.
+const listStreamReleaseThreshold = 100_000
 
 // listStreamBatchWriter writes the {"list": [...]} line of one listing callback item by item,
 // so a directory of millions of entries is never held as items or as one encoded line. The
@@ -170,6 +175,13 @@ func rcListStream(ctx context.Context, in rc.Params) (out rc.Params, err error) 
 		count += written
 		return err
 	})
+	if count >= listStreamReleaseThreshold {
+		// Go returns freed memory to the system only minutes after a large listing, so a walk of
+		// millions of entries would keep its peak long after its reply. Hand it back once the
+		// stream has ended, without delaying the reply.
+		defer func() { go debug.FreeOSMemory() }()
+	}
+
 	// Every listing callback has returned, so the trailer needs no lock.
 	trailer := listStreamTrailer{Done: true, Count: count}
 	if listErr != nil {
