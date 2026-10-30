@@ -608,6 +608,7 @@ as the source and the destination will be the same file.
 This feature may be useful backups made with --copy-dest.`,
 			Advanced: true,
 		}},
+		CommandHelp: commandHelp,
 	}
 	fs.Register(fsi)
 }
@@ -2348,6 +2349,59 @@ func (f *Fs) Shutdown(ctx context.Context) error {
 	return f.drainPool(ctx)
 }
 
+var commandHelp = []fs.CommandHelp{{
+	Name:  "home",
+	Short: "Show the absolute path of the login folder.",
+	Long: `Asks the server for the absolute path of the folder the account logs
+in to, which is where paths that don't start with "/" are resolved.
+
+Usage example:
+
+` + "```console" + `
+rclone backend home remote:
+` + "```" + `
+
+The path is reported as the server spells it, e.g. "/home/user", or "/"
+on a server which confines the account to its own folder.`,
+}}
+
+// Command the backend to run a named command
+//
+// The command run is name
+// args may be used to read arguments from
+// opts may be used to read optional arguments from
+//
+// The result should be capable of being JSON encoded
+// If it is a string or a []string it will be shown to the user
+// otherwise it will be JSON encoded and shown to the user like that
+func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (out any, err error) {
+	switch name {
+	case "home":
+		return f.home(ctx)
+	default:
+		return nil, fs.ErrorCommandNotFound
+	}
+}
+
+// home returns the absolute path of the login folder, resolved by the
+// server the same way NewFs resolves a relative root.
+func (f *Fs) home(ctx context.Context) (string, error) {
+	c, err := f.getSftpConnection(ctx)
+	if err != nil {
+		return "", fmt.Errorf("home: %w", err)
+	}
+	home, err := c.sftpClient.RealPath(".")
+	if err != nil {
+		fs.Debugf(f, "Failed to resolve the login folder using RealPath: %v", err)
+		home, err = c.sftpClient.Getwd()
+	}
+	f.putSftpConnection(&c, err)
+	if err != nil {
+		return "", fmt.Errorf("home: %w", err)
+	}
+	return f.opt.Enc.ToStandardPath(home), nil
+}
+
 // Fs is the filesystem this remote sftp file object is located within
 func (o *Object) Fs() fs.Info {
 	return o.fs
@@ -2851,5 +2905,6 @@ var (
 	_ fs.DirSetModTimer = &Fs{}
 	_ fs.Abouter        = &Fs{}
 	_ fs.Shutdowner     = &Fs{}
+	_ fs.Commander      = &Fs{}
 	_ fs.Object         = &Object{}
 )

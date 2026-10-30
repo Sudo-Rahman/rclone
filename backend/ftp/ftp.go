@@ -247,6 +247,7 @@ a write only folder.
 				Help:  "VsFTPd can't handle file names starting with dot",
 			}},
 		}},
+		CommandHelp: commandHelp,
 	})
 }
 
@@ -754,6 +755,55 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (ff fs.Fs
 // cached connections.
 func (f *Fs) Shutdown(ctx context.Context) error {
 	return f.drainPool(ctx)
+}
+
+var commandHelp = []fs.CommandHelp{{
+	Name:  "home",
+	Short: "Show the absolute path of the login folder.",
+	Long: `Asks the server for the absolute path of the folder the account logs
+in to, which is where paths that don't start with "/" are resolved.
+
+Usage example:
+
+` + "```console" + `
+rclone backend home remote:
+` + "```" + `
+
+The path is reported as the server spells it, e.g. "/home/user", or "/"
+on a server which confines the account to its own folder.`,
+}}
+
+// Command the backend to run a named command
+//
+// The command run is name
+// args may be used to read arguments from
+// opts may be used to read optional arguments from
+//
+// The result should be capable of being JSON encoded
+// If it is a string or a []string it will be shown to the user
+// otherwise it will be JSON encoded and shown to the user like that
+func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (out any, err error) {
+	switch name {
+	case "home":
+		return f.home(ctx)
+	default:
+		return nil, fs.ErrorCommandNotFound
+	}
+}
+
+// home returns the absolute path of the login folder. Connections never
+// change directory, so the server's current directory is that folder.
+func (f *Fs) home(ctx context.Context) (string, error) {
+	c, err := f.getFtpConnection(ctx)
+	if err != nil {
+		return "", fmt.Errorf("home: %w", err)
+	}
+	home, err := c.CurrentDir()
+	f.putFtpConnection(&c, err)
+	if err != nil {
+		return "", fmt.Errorf("home: %w", err)
+	}
+	return f.opt.Enc.ToStandardPath(home), nil
 }
 
 // translateErrorFile turns FTP errors into rclone errors if possible for a file
@@ -1456,5 +1506,6 @@ var (
 	_ fs.DirMover    = &Fs{}
 	_ fs.PutStreamer = &Fs{}
 	_ fs.Shutdowner  = &Fs{}
+	_ fs.Commander   = &Fs{}
 	_ fs.Object      = &Object{}
 )
